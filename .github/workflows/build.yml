@@ -1,15 +1,14 @@
 # Compile check only — a built .so is worthless to anyone else, since Hyprland
-# plugins are ABI-bound to the exact version they were built against. What this
-# is actually for: when Arch ships a Hyprland that changed an internal API, this
-# job goes red before the next `make clean && make` on the workstation does.
+# plugins are ABI-bound to the exact version they were built against. This
+# verifies that a tagged release still builds against current Arch Hyprland.
 name: build
 
 on:
   push:
-  pull_request:
-  schedule:
-    # Weekly, so an upstream API break surfaces without a push.
-    - cron: "0 6 * * 1"
+    tags:
+      # 0.1.0 and v0.1.0 both count; nothing else triggers this.
+      - "[0-9]*"
+      - "v[0-9]*"
 
 jobs:
   build:
