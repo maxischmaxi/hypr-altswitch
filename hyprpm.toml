@@ -1,0 +1,18 @@
+# Manifest for hyprpm, Hyprland's plugin manager. hyprpm clones this repo plus
+# the matching Hyprland sources and builds on the user's machine — which is the
+# only thing that makes sense for an ABI-bound plugin.
+#
+#   hyprpm add https://github.com/<you>/hypr-altswitch
+#   hyprpm enable hypr-altswitch
+#
+# Untested end to end: a real `hyprpm add` pulls the full Hyprland source tree.
+
+[repository]
+name = "hypr-altswitch"
+authors = ["max"]
+
+[hypr-altswitch]
+description = "alt-tab window switcher with window thumbnails"
+authors = ["max"]
+output = "build/hypr-altswitch.so"
+build = ["make clean", "make all"]
