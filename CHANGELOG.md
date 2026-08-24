@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+### Mouse
+
+The overlay can be driven with the mouse: hover moves the selection, a click on
+a thumbnail focuses that window and closes it. Keyboard and mouse share the same
+`index`, so a click just takes whatever is currently ringed.
+
+- Three listeners on `Event::bus()->m_events.input.mouse.{move,button,axis}`.
+  These are `Cancellable<...>`, i.e. the handler is handed an
+  `Event::SCallbackInfo&` — setting `cancelled` makes `CInputManager` return
+  before keybind dispatch, before `PROTO::inputCapture` and before
+  `CSeatManager::sendPointerButton`. Nothing reaches the client underneath.
+  (`registerCallbackDynamic` is deprecated and inert since 0.56; the event bus is
+  the only way in, and no function hook is needed.)
+- Hit testing lives in the C core (`sw_hit_test`), against the tile cell rather
+  than the letterboxed picture inside it — the cell is what the selection ring
+  is drawn around. Renderer and mouse both go through `overlayLayoutFor()`, so
+  what a click hits is by construction what was drawn.
+- `sw_select` reports whether the selection actually moved, and only then is a
+  redraw asked for. `hal_request_redraw` damages the whole screen, so doing it
+  per motion event would mean a full recomposition per frame for nothing.
+- Commit happens on press, not on release. The overlay hangs off held ALT; if
+  ALT comes up between press and release, the watchdog closes the overlay and
+  the release would land in the freshly focused window.
+- Every press ends the cycle — a tile commits, anything else cancels. No button
+  can be swallowed without handing the pointer back.
+
+### Not swallowing the pointer forever
+
+Eating input is the one thing here that can strand a user, so the swallow
+condition is deliberately made of state that cannot get stuck:
+
+- It hangs off `g_drawnOn` — the monitors the overlay actually reached the
+  screen on — not off `sw_is_active`. With `render:direct_scanout` a fullscreen
+  client's buffer bypasses the render pass entirely: `RENDER_LAST_MOMENT` never
+  fires, the overlay is invisible, and swallowing clicks there would leave the
+  mouse dead until ALT came up. Same for a DPMS-off monitor.
+- No separate "pointer is grabbed" flag. `fault()` clears `g_healthy` *and* the
+  switcher state, so an unhealthy plugin stops swallowing in the same breath.
+- A drag that started before the overlay is left alone
+  (`g_pInputManager->hasHeldButtons()`). A press we cancel never enters
+  Hyprland's held-buttons list, so Hyprland itself drops the orphaned release —
+  no bookkeeping needed on this side.
+- All listeners live in one struct that `PLUGIN_EXIT` resets wholesale. A
+  forgotten listener is a call into unmapped memory after `dlclose`, which no
+  amount of `guarded()` can catch. `PLUGIN_EXIT` and `fault()` now also damage
+  the screen, so a stale overlay cannot stay on as a still image.
+
+### Known gaps
+
+- With `cursor:zoom_factor` in play the hit test misses: the zoom scales the
+  rendered frame without touching layout coordinates.
+- Touch, tablet and touchpad gestures are not swallowed. They are cancellable
+  the same way, but for a mouse setup it is weight without a use.
+- While motion is cancelled, Hyprland's `m_lastCursorPosFloored` freezes at the
+  position the cursor had when the overlay opened. Return to that exact pixel
+  and no move event is emitted, so the ring sits still. Cosmetic, and not
+  fixable from outside.
+
 ## 0.1.0
 
 First working version.

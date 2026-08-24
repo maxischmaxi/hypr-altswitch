@@ -15,6 +15,11 @@ struct lua_State;
 /* Shared with the renderer in plugin.cpp. */
 extern sw_state g_switcher;
 
+/* The actions themselves, shared by the Lua callbacks and the mouse handling in
+ * plugin.cpp. */
+void altswitch_commit(void);
+void altswitch_cancel(void);
+
 /* Lua C callbacks, registered from plugin.cpp. */
 int altswitch_lua_next(struct lua_State *L);
 int altswitch_lua_prev(struct lua_State *L);

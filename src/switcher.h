@@ -77,6 +77,10 @@ typedef struct {
 	int      grouped; /* 0 when everything sits on one workspace */
 } sw_layout_result;
 
+/* Results of sw_hit_test that are not a tile index. */
+#define SW_HIT_NONE  (-2) /* outside the panel */
+#define SW_HIT_PANEL (-1) /* inside the panel, but on no tile */
+
 void          sw_reset(sw_state *s);
 /* Takes a snapshot, orders it by workspace and screen position, and preselects
  * the most recently used window that is not the current one. */
@@ -87,5 +91,11 @@ int           sw_index(const sw_state *s);
 uint64_t      sw_selected(const sw_state *s);
 sw_layout_cfg sw_default_cfg(void);
 void          sw_layout(const sw_state *s, float screen_w, float screen_h, const sw_layout_cfg *cfg, sw_layout_result *out);
+/* Which tile sits under (x, y), in the same monitor-local coordinates the layout
+ * was built in. Takes the layout rather than rebuilding it, so what the mouse
+ * hits is by construction what was drawn. */
+int           sw_hit_test(const sw_layout_result *l, float x, float y);
+/* Moves the selection to an absolute index. Returns 1 if it moved. */
+int           sw_select(sw_state *s, int index);
 
 #endif /* HYPR_ALTSWITCH_SWITCHER_H */

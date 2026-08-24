@@ -39,6 +39,25 @@ Also available: `cancel()`, `active()`, `healthy()`.
 
 `healthy()` is worth binding your config around — see below.
 
+## Mouse
+
+While the overlay is up it owns the pointer. Move the mouse and the selection
+ring follows the cursor; click a thumbnail and that window is focused and the
+overlay closes. Clicking next to the panel closes it without switching, and any
+other button does the same — every press ends the cycle, so the overlay can
+never hold the pointer for longer than one click.
+
+Nothing reaches the window underneath: motion, buttons and scrolling are all
+cancelled at Hyprland's event bus, before keybinds and before anything is sent
+to the client. The cursor itself still moves normally.
+
+Two deliberate limits:
+
+- The overlay stays tied to the key that opened it, so this is a "hold ALT, move
+  the mouse, click" gesture. There is no mode where it stays open on its own.
+- A drag that was already in progress keeps the pointer — the plugin stays out
+  of the way rather than freezing it halfway.
+
 ## Not crashing your compositor
 
 Three layers, because a plugin fault normally takes the whole session with it:

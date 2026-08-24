@@ -34,13 +34,18 @@
 #include <cairo/cairo.h>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/config/shared/actions/ConfigActions.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/version.h>
+#include <linux/input-event-codes.h>
 
 #include <vector>
 #include <unordered_map>
 #include <string>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
+#include <optional>
 
 extern "C" {
 #include "switcher.h"
@@ -67,7 +72,21 @@ static std::string                            g_faultReason;
 /* Rendered workspace labels, keyed by the text itself. */
 static std::unordered_map<std::string, SP<Render::ITexture>> g_labels;
 
-static Hyprutils::Signal::CHyprSignalListener g_renderListener;
+/* One place for all of them: PLUGIN_EXIT resets the whole struct, so a listener
+ * cannot be forgotten. A forgotten one is a call into unmapped memory after
+ * dlclose, and none of the plugin's safety nets reach that far. */
+static struct {
+    Hyprutils::Signal::CHyprSignalListener render, pointerMove, pointerButton, pointerAxis;
+} g_listeners;
+
+/* Monitors the overlay actually made it onto since the cycle started.
+ *
+ * Swallowing pointer events hangs off this rather than off sw_is_active: with
+ * direct scanout a fullscreen client's buffer goes straight to the display and
+ * no render pass is built, so RENDER_LAST_MOMENT never fires and the overlay is
+ * nowhere to be seen. Eating clicks over an overlay nobody can see would leave
+ * the mouse dead until ALT comes back up. */
+static std::vector<MONITORID> g_drawnOn;
 
 /* ------------------------------------------------------------------ */
 /* fault handling                                                      */
@@ -87,6 +106,14 @@ static void fault(const char* where, const std::string& what) {
     /* Drop everything we hold; a broken plugin should not keep textures or a
      * half-built selection alive. */
     sw_reset(&g_switcher);
+    g_drawnOn.clear();
+
+    /* Not via hal_request_redraw: that runs inside guarded(), which is already a
+     * no-op by now — and without damage the last overlay frame stays frozen on
+     * screen until something else repaints. */
+    try {
+        g_pHyprRenderer->damageBox(CBox{-1e5, -1e5, 2e5, 2e5});
+    } catch (...) {}
 
     if (!g_faultNotified) {
         g_faultNotified = true;
@@ -199,6 +226,9 @@ extern "C" int hal_collect_windows(sw_window* out, int max) {
     if (!out || max <= 0)
         return 0;
 
+    /* A fresh cycle: nothing has been drawn for it yet. */
+    g_drawnOn.clear();
+
     int n = 0;
     const bool ok = guarded("collect", [&]() {
         const auto focused = Desktop::focusState()->window();
@@ -255,8 +285,10 @@ extern "C" void hal_request_redraw() {
 }
 
 extern "C" void hal_end_switch() {
-    /* Nothing to release: tiles render the window's own live texture, so there
-     * is no per-cycle state to hold on to. */
+    /* No textures to release: tiles render the window's own live texture. The
+     * one piece of per-cycle state is where the overlay was drawn, and with the
+     * cycle over the mouse must stop being swallowed. */
+    g_drawnOn.clear();
 }
 
 extern "C" int hal_thumb_count() {
@@ -359,21 +391,29 @@ static void addLabel(const sw_rect& box, const std::string& text) {
     g_pHyprRenderer->currentPass().add(makeUnique<CTexPassElement>(data));
 }
 
-static void drawOverlay() {
-    const auto monitor = g_pHyprRenderer->renderData().pMonitor.lock();
+/* The overlay geometry for one monitor. Both the renderer and the mouse go
+ * through here, so what a click hits is by construction what was drawn. */
+static bool overlayLayoutFor(const PHLMONITOR& monitor, sw_layout_result& out) {
     if (!monitor)
-        return;
+        return false;
 
-    const auto mSize = monitor->m_size;
-    if (mSize.x <= 0 || mSize.y <= 0)
-        return;
+    const auto size = monitor->m_size;
+    if (size.x <= 0 || size.y <= 0)
+        return false;
 
-    const auto       cfg = sw_default_cfg();
+    const auto cfg = sw_default_cfg();
+    sw_layout(&g_switcher, size.x, size.y, &cfg, &out);
+    return out.tile_count > 0;
+}
+
+static void drawOverlay() {
+    const auto       monitor = g_pHyprRenderer->renderData().pMonitor.lock();
     sw_layout_result l{};
-    sw_layout(&g_switcher, mSize.x, mSize.y, &cfg, &l);
-    if (l.tile_count <= 0)
+    if (!overlayLayoutFor(monitor, l))
         return;
 
+    const auto  mSize    = monitor->m_size;
+    const auto  cfg      = sw_default_cfg();
     const float ui       = mSize.y / 1080.0F;
     const int   panelR   = static_cast<int>(14 * ui);
     const int   tileR    = static_cast<int>(7 * ui);
@@ -419,6 +459,109 @@ static void drawOverlay() {
             addBorder(ring, Palette::RING, ui > 1.5F ? 3 : 2, tileR + static_cast<int>(ringPad));
         }
     }
+
+    /* The overlay is on this monitor's screen — the mouse may now claim it. */
+    if (std::ranges::find(g_drawnOn, monitor->m_id) == g_drawnOn.end())
+        g_drawnOn.push_back(monitor->m_id);
+}
+
+/* ------------------------------------------------------------------ */
+/* mouse                                                               */
+/* ------------------------------------------------------------------ */
+
+/* Does the overlay own this pointer event? It does when it is up and the user
+ * can actually see it where the cursor is — that second half is what keeps a
+ * click from vanishing into an overlay direct scanout never drew.
+ *
+ * On success `mon` is the monitor under the cursor and `local` the cursor in
+ * that monitor's logical coordinates, the space the layout is built in.
+ *
+ * `at` is the position the move event already carried; without one the pointer
+ * is asked where it is. */
+static bool overlayOwnsPointer(std::optional<Vector2D> at, PHLMONITOR& mon, Vector2D& local) {
+    /* This runs on every pointer event in the session, so the way out comes
+     * first. It is also the whole reason the plugin cannot lock the mouse up:
+     * fault() clears both g_healthy and the switcher state, so an unhealthy
+     * plugin stops swallowing in the same breath. */
+    if (!g_healthy || !sw_is_active(&g_switcher))
+        return false;
+
+    bool owns = false;
+    guarded("pointer", [&]() {
+        /* A drag that started before the overlay keeps the pointer. Freezing it
+         * halfway and handing it back somewhere else is worse than staying out
+         * of the way. */
+        if (g_pInputManager->hasHeldButtons())
+            return;
+
+        const auto global = at.value_or(g_pInputManager->getMouseCoordsInternal());
+
+        mon = State::monitorState()->query().vec(global).run();
+        if (!mon || std::ranges::find(g_drawnOn, mon->m_id) == g_drawnOn.end())
+            return;
+
+        /* Pass elements are drawn in monitor-local logical coordinates, and the
+         * layout is built in the same space — so this is a subtraction, not a
+         * scale conversion. */
+        local = global - mon->m_position;
+        owns  = true;
+    });
+    return owns;
+}
+
+static void onPointerMove(const Vector2D& global, Event::SCallbackInfo& info) {
+    PHLMONITOR mon;
+    Vector2D   local;
+    if (!overlayOwnsPointer(global, mon, local))
+        return;
+
+    /* The client below sees nothing: no motion, no enter, no leave. The cursor
+     * itself still moves — Hyprland warps it before this event is emitted. */
+    info.cancelled = true;
+
+    guarded("pointer/move", [&]() {
+        sw_layout_result l{};
+        if (!overlayLayoutFor(mon, l))
+            return;
+
+        /* Off the tiles the selection stays put: no flicker crossing the gaps,
+         * and a stray movement cannot throw away what the keyboard picked. */
+        const int hit = sw_hit_test(&l, local.x, local.y);
+        if (hit >= 0 && sw_select(&g_switcher, hit))
+            hal_request_redraw();
+    });
+}
+
+static void onPointerButton(const IPointer::SButtonEvent& e, Event::SCallbackInfo& info) {
+    PHLMONITOR mon;
+    Vector2D   local;
+    if (!overlayOwnsPointer(std::nullopt, mon, local))
+        return;
+
+    info.cancelled = true;
+
+    /* Only the press acts on anything. Its release is swallowed here too while
+     * the overlay is still up, and once the press has closed the overlay
+     * Hyprland drops the orphaned release itself — a button whose press was
+     * cancelled never entered its held-buttons list. */
+    if (e.state != WL_POINTER_BUTTON_STATE_PRESSED)
+        return;
+
+    guarded("pointer/button", [&]() {
+        sw_layout_result l{};
+        int              hit = SW_HIT_NONE;
+        if (e.button == BTN_LEFT && overlayLayoutFor(mon, l))
+            hit = sw_hit_test(&l, local.x, local.y);
+
+        /* Every press ends the cycle one way or the other — a tile commits,
+         * anything else cancels. So no button can ever be swallowed without
+         * handing the pointer back. */
+        if (hit >= 0) {
+            sw_select(&g_switcher, hit);
+            altswitch_commit();
+        } else
+            altswitch_cancel();
+    });
 }
 
 static void onRenderStage(eRenderStage stage) {
@@ -462,7 +605,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "altswitch", "healthy", altswitch_lua_healthy);
     HyprlandAPI::addLuaFunction(PHANDLE, "altswitch", "stats", altswitch_lua_stats);
 
-    g_renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) { onRenderStage(stage); });
+    g_listeners.render        = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) { onRenderStage(stage); });
+    g_listeners.pointerMove   = Event::bus()->m_events.input.mouse.move.listen([](Vector2D pos, Event::SCallbackInfo& info) { onPointerMove(pos, info); });
+    g_listeners.pointerButton = Event::bus()->m_events.input.mouse.button.listen([](IPointer::SButtonEvent e, Event::SCallbackInfo& info) { onPointerButton(e, info); });
+    /* Scrolling has no meaning here, but it must not reach the window under the
+     * overlay either. */
+    g_listeners.pointerAxis = Event::bus()->m_events.input.mouse.axis.listen([](IPointer::SAxisEvent, Event::SCallbackInfo& info) {
+        PHLMONITOR mon;
+        Vector2D   local;
+        if (overlayOwnsPointer(std::nullopt, mon, local))
+            info.cancelled = true;
+    });
 
     notify("[hypr-altswitch] loaded", CHyprColor{0.6, 0.7, 0.9, 1.0}, 3000);
 
@@ -470,10 +623,19 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    g_renderListener.reset();
+    /* All of them at once, so none can be left listening into a library that is
+     * about to be unmapped. */
+    g_listeners = {};
 
     try {
         g_labels.clear();
     } catch (...) {}
     sw_reset(&g_switcher);
+    g_drawnOn.clear();
+
+    /* An overlay that was on screen when the plugin went away would otherwise
+     * stay there as a still image. */
+    try {
+        g_pHyprRenderer->damageBox(CBox{-1e5, -1e5, 2e5, 2e5});
+    } catch (...) {}
 }

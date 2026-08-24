@@ -48,22 +48,36 @@ int altswitch_lua_prev(struct lua_State *L) {
 	return 0;
 }
 
-int altswitch_lua_commit(struct lua_State *L) {
-	(void)L;
+/* Tear the overlay down and focus whatever was selected. Shared with the mouse
+ * path in plugin.cpp, which commits on a click.
+ *
+ * Order matters: the state has to be gone before hal_focus_window, because
+ * focusing can make Hyprland re-emit pointer events, and those must find the
+ * overlay closed rather than swallow themselves. */
+void altswitch_commit(void) {
 	uint64_t id = sw_selected(&g_switcher);
 	sw_reset(&g_switcher);
 	hal_end_switch();
 	hal_request_redraw();
 	if (id)
 		hal_focus_window(id);
+}
+
+void altswitch_cancel(void) {
+	sw_reset(&g_switcher);
+	hal_end_switch();
+	hal_request_redraw();
+}
+
+int altswitch_lua_commit(struct lua_State *L) {
+	(void)L;
+	altswitch_commit();
 	return 0;
 }
 
 int altswitch_lua_cancel(struct lua_State *L) {
 	(void)L;
-	sw_reset(&g_switcher);
-	hal_end_switch();
-	hal_request_redraw();
+	altswitch_cancel();
 	return 0;
 }
 

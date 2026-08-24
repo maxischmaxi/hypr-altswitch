@@ -100,6 +100,30 @@ uint64_t sw_selected(const sw_state *s) {
 	return s->items[s->index].id;
 }
 
+int sw_select(sw_state *s, int index) {
+	if (!sw_is_active(s) || index < 0 || index >= s->count || index == s->index)
+		return 0;
+	s->index = index;
+	return 1;
+}
+
+static int inside(const sw_rect *r, float x, float y) {
+	return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+}
+
+int sw_hit_test(const sw_layout_result *l, float x, float y) {
+	if (!l || l->tile_count <= 0)
+		return SW_HIT_NONE;
+	if (!inside(&l->panel, x, y))
+		return SW_HIT_NONE;
+
+	for (int i = 0; i < l->tile_count && i < SW_MAX_WINDOWS; ++i) {
+		if (inside(&l->tiles[i], x, y))
+			return i;
+	}
+	return SW_HIT_PANEL;
+}
+
 sw_layout_cfg sw_default_cfg(void) {
 	sw_layout_cfg cfg;
 	cfg.tile_w      = 300.0f;
